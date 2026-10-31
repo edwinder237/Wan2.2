@@ -4,13 +4,13 @@ import torch
 try:
     import flash_attn_interface
     FLASH_ATTN_3_AVAILABLE = True
-except ModuleNotFoundError:
+except ImportError:
     FLASH_ATTN_3_AVAILABLE = False
 
 try:
     import flash_attn
     FLASH_ATTN_2_AVAILABLE = True
-except ModuleNotFoundError:
+except ImportError:
     FLASH_ATTN_2_AVAILABLE = False
 
 import warnings
@@ -51,6 +51,21 @@ def flash_attention(
     """
     half_dtypes = (torch.float16, torch.bfloat16)
     assert dtype in half_dtypes
+
+    # Fallback for platforms without flash-attn (e.g. native Windows builds).
+    if not (FLASH_ATTN_2_AVAILABLE or FLASH_ATTN_3_AVAILABLE):
+        return _sdpa_attention(
+            q,
+            k,
+            v,
+            k_lens=k_lens,
+            dropout_p=dropout_p,
+            softmax_scale=softmax_scale,
+            q_scale=q_scale,
+            causal=causal,
+            window_size=window_size,
+            dtype=dtype)
+
     assert q.device.type == 'cuda' and q.size(-1) <= 256
 
     # params
@@ -128,6 +143,75 @@ def flash_attention(
 
     # output
     return x.type(out_dtype)
+
+
+def _sdpa_attention(
+    q,
+    k,
+    v,
+    k_lens=None,
+    dropout_p=0.,
+    softmax_scale=None,
+    q_scale=None,
+    causal=False,
+    window_size=(-1, -1),
+    dtype=torch.bfloat16,
+):
+    """
+    PyTorch scaled_dot_product_attention fallback with the same interface and
+    semantics as `flash_attention` (key padding via `k_lens`, GQA, causal).
+    q: [B, Lq, Nq, C1], k: [B, Lk, Nk, C1], v: [B, Lk, Nk, C2].
+    """
+    if tuple(window_size) != (-1, -1):
+        warnings.warn(
+            'Sliding window attention is not supported by the SDPA fallback; '
+            'using full attention instead.')
+
+    half_dtypes = (torch.float16, torch.bfloat16)
+    out_dtype = q.dtype
+    b, lq, nq, _ = q.shape
+    lk, nk = k.size(1), k.size(2)
+
+    def half(x):
+        return x if x.dtype in half_dtypes else x.to(dtype)
+
+    if q_scale is not None:
+        q = q * q_scale
+
+    q, k, v = half(q), half(k), half(v)
+    k = k.to(q.dtype)
+    v = v.to(q.dtype)
+
+    # [B, L, N, C] -> [B, N, L, C]
+    q = q.transpose(1, 2)
+    k = k.transpose(1, 2)
+    v = v.transpose(1, 2)
+
+    if nq != nk:
+        assert nq % nk == 0
+        k = k.repeat_interleave(nq // nk, dim=1)
+        v = v.repeat_interleave(nq // nk, dim=1)
+
+    attn_mask = None
+    if k_lens is not None:
+        k_lens = k_lens.to(q.device)
+        attn_mask = (torch.arange(lk, device=q.device)[None, :] <
+                     k_lens[:, None]).view(b, 1, 1, lk)
+    if causal:
+        causal_mask = torch.ones(
+            lq, lk, dtype=torch.bool, device=q.device).tril(lk - lq)
+        attn_mask = causal_mask[None, None] if attn_mask is None else (
+            attn_mask & causal_mask[None, None])
+
+    out = torch.nn.functional.scaled_dot_product_attention(
+        q,
+        k,
+        v,
+        attn_mask=attn_mask,
+        dropout_p=dropout_p,
+        scale=softmax_scale)
+
+    return out.transpose(1, 2).contiguous().type(out_dtype)
 
 
 def attention(
